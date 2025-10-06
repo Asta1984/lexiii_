@@ -1,8 +1,3 @@
-"""
-Legal Document Drafting System
-FastAPI-based service for ingesting legal documents, creating templates, and generating drafts
-"""
-
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -15,7 +10,7 @@ from datetime import datetime
 # Import our modules
 from document_processor import DocumentProcessor
 from template_engine import TemplateEngine
-from database import Database, Template, Variable, DraftSession
+from db import Database, Template, Variable, DraftSession
 from question_generator import QuestionGenerator
 from web_search import WebSearchService
 
@@ -331,7 +326,7 @@ async def get_session(session_id: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
+    return {"status": "healthy", "timestamp": datetime.now()}
 
 
 if __name__ == "__main__":
