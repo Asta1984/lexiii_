@@ -3,7 +3,7 @@ test.py
 __pycache__/
 *.py[codz]
 *$py.class
-
+legal_drafting.db
 # C extensions
 *.so
 
