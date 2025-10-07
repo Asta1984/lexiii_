@@ -6,7 +6,7 @@ __pycache__/
 legal_drafting.db
 # C extensions
 *.so
-
+test.py
 # Distribution / packaging
 .Python
 build/

@@ -8,6 +8,6 @@ httpx
 pydantic
 pydantic-settings
 python-dotenv
-google-generativeai
 exa-py
+google-genai
 

@@ -1,22 +1,31 @@
-import google.generativeai as genai
+# template_engine.py (Updated)
+from google import genai
 import json
 import re
 import uuid
 import markdown
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from config import GOOGLE_API_KEY
 
 class TemplateEngine:
-    """Uses Gemini API for document templating, variable extraction, and drafting."""
+    """Uses the updated Gemini API SDK for templating, variable extraction, and drafting."""
 
     def __init__(self):
-        genai.configure(api_key=GOOGLE_API_KEY)
-        self.model = genai.GenerativeModel('gemini-pro')
+        """
+        Initializes the client using the new SDK syntax.
+        The API key is automatically read from the GOOGLE_API_KEY environment variable if not passed directly.
+        """
+        self.client = genai.Client(api_key=GOOGLE_API_KEY)
+        self.model_name = "models/gemini-2.5-flash"
 
     def _call_gemini(self, prompt: str) -> str:
-        """Helper function to call the Gemini API and get a response."""
+        """Helper function to call the Gemini API with the new SDK."""
         try:
-            response = self.model.generate_content(prompt)
+            # The new syntax uses client.models.generate_content
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
             return response.text
         except Exception as e:
             print(f"Error calling Gemini API: {e}")
@@ -29,7 +38,7 @@ class TemplateEngine:
         prompt = f"""
         Analyze the following legal document text. Your task is to:
         1. Identify all specific details that are likely to change each time the document is used (e.g., names, dates, addresses, monetary amounts, specific terms).
-        2. Replace these details with clear, snake_case placeholders enclosed in double curly braces, like {{variable_name}}.
+        2. Replace these details with clear, snake_case placeholders enclosed in double curly braces, like {{{{variable_name}}}}.
         3. Generate a brief, one-sentence description of the document's purpose.
         4. Return a single JSON object with two keys: "markdown" containing the templated text, and "description" containing the description.
 
@@ -40,7 +49,7 @@ class TemplateEngine:
 
         EXAMPLE JSON OUTPUT:
         {{
-            "markdown": "This Non-Disclosure Agreement is made on {{agreement_date}}, between {{disclosing_party_name}} and {{receiving_party_name}}...",
+            "markdown": "This Non-Disclosure Agreement is made on {{{{agreement_date}}}}, between {{{{disclosing_party_name}}}} and {{{{receiving_party_name}}}}...",
             "description": "A standard non-disclosure agreement to protect confidential information."
         }}
         """
@@ -72,7 +81,7 @@ class TemplateEngine:
             3. "examples": A list of 2 realistic example values.
 
             CONTEXT:
-            ---
+            
             {markdown_content[:2000]}
             ---
 

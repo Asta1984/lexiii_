@@ -5,30 +5,39 @@ from typing import List, Optional, Dict, Any
 from enum import Enum
 import uvicorn
 import os
+import tempfile
+import mimetypes
+import pathlib
 from datetime import datetime
 
-# Import our modules
+# ---- external modules (your own packages) ----
 from document_processor import DocumentProcessor
 from template_engine import TemplateEngine
 from db import Database, Template, Variable, DraftSession
 from question_generator import QuestionGenerator
 from web_search import WebSearchService
 
-app = FastAPI(
-    title="Legal Document Drafting System",
-    description="AI-powered legal document templating and drafting service",
-    version="1.0.0"
-)
+# ---- optional Gemini integration ----
+from google import genai
+from google.genai import types
+from config import GOOGLE_API_KEY
+import time
 
-# Initialize services
+# =============== Initialize services and app ===============
+client = genai.Client(api_key=GOOGLE_API_KEY)
 db = Database()
 doc_processor = DocumentProcessor()
 template_engine = TemplateEngine()
 question_gen = QuestionGenerator()
 web_search = WebSearchService()
 
+app = FastAPI(
+    title="Legal Document Drafting System",
+    description="AI-powered legal document templating and drafting service",
+    version="0.0.2",
+)
 
-# Pydantic Models
+# =============== Pydantic Models ===============
 class VariableType(str, Enum):
     TEXT = "text"
     DATE = "date"
@@ -59,73 +68,79 @@ class TemplateResponse(BaseModel):
 
 
 class DraftRequest(BaseModel):
-    matter_type: str = Field(..., description="Type of legal matter (e.g., 'NDA', 'Employment Contract')")
-    context: Optional[Dict[str, Any]] = Field(default={}, description="Any pre-filled context")
+    matter_type: str
+    context: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 
-class QuestionResponse(BaseModel):
-    variable_id: str
-    question: str
-    type: VariableType
-    examples: List[str] = []
-    constraints: Optional[Dict[str, Any]] = None
-    help_text: Optional[str] = None
+# =============== Helper function for MIME type ===============
+def get_file_mime_type(file: UploadFile) -> str:
+    if file.content_type:
+        return file.content_type
+    mime, _ = mimetypes.guess_type(file.filename)
+    return mime or "application/octet-stream"
 
 
-class AnswerSubmission(BaseModel):
-    session_id: str
-    answers: Dict[str, Any]  # variable_id: value
-
-
-class DraftResponse(BaseModel):
-    session_id: str
-    template_id: str
-    markdown_draft: str
-    html_draft: Optional[str] = None
-    completed_at: datetime
-
-
-# API Endpoints
-
+# =============================================================
+#                 UPLOAD ENDPOINT (WITH FIXED FILE HANDLING)
+# =============================================================
 @app.post("/upload", response_model=TemplateResponse)
 async def upload_document(
     file: UploadFile = File(...),
-    matter_type: Optional[str] = None,
-    background_tasks: BackgroundTasks = None
-):
-    """
-    Upload a legal document (DOCX/PDF) and convert it to a reusable template.
-    Extracts variables and stores them in the database.
-    """
-    if file.content_type not in ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
-        raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported")
-    
+    matter_type: Optional[str] = None,):
+    mime_type = get_file_mime_type(file)
+    allowed = [
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ]
+    if mime_type not in allowed:
+        raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported.")
+
+    temp_file_path = None
+    uploaded_file = None
     try:
-        # Read file content
-        content = await file.read()
-        
-        # Extract text from document
-        text = doc_processor.extract_text(content, file.content_type)
-        
-        # Convert to template with variables
+        # Read file bytes
+        file_bytes = await file.read()
+
+        # --- correct file handling: save to a temp file ---
+        suffix = os.path.splitext(file.filename)[1] or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_bytes)
+            temp_file_path = tmp.name
+
+        file_path = pathlib.Path(temp_file_path)
+
+        # --- If you want to optionally process with Gemini ---
+        try:
+            uploaded_file = client.files.upload(file=file_path)
+            # wait for activation
+            for _ in range(30):
+                if uploaded_file.state.name != "PROCESSING":
+                    break
+                time.sleep(2)
+                uploaded_file = client.files.get(uploaded_file.name)
+            print(f"[Gemini] File uploaded, state: {uploaded_file.state.name}")
+        except Exception as gemini_error:
+            # not fatal for DOCX (Gemini doesn't support DOCX)
+            print(f"[Gemini] Skipped: {gemini_error}")
+
+        # --- Your document-processing logic ---
+        text = doc_processor.extract_text(file_bytes, mime_type)
+
         template_result = template_engine.convert_to_template(text)
-        
-        # Auto-detect matter type if not provided
+
         if not matter_type:
             matter_type = template_engine.detect_matter_type(text)
-        
-        # Extract and analyze variables
+
         variables = template_engine.extract_variables(template_result["markdown"])
-        
-        # Store in database
+
         template = db.create_template(
-            name=file.filename.rsplit('.', 1)[0],
+            name=file.filename.rsplit(".", 1)[0],
             matter_type=matter_type,
             description=template_result.get("description", ""),
             markdown_content=template_result["markdown"],
-            variables=variables
+            variables=variables,
         )
-        
+
         return TemplateResponse(
             id=template.id,
             name=template.name,
@@ -133,194 +148,207 @@ async def upload_document(
             description=template.description,
             variables=[VariableResponse(**var) for var in template.variables],
             markdown_content=template.markdown_content,
-            created_at=template.created_at
+            created_at=template.created_at,
         )
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
 
+    finally:
+        # --- cleanup Gemini & temp file ---
+        if uploaded_file:
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+                print(f"[Cleanup] Deleted temp file {temp_file_path}")
+            except Exception:
+                pass
 
-@app.post("/draft/start")
-async def start_draft(request: DraftRequest):
-    """
-    Start a new draft session. Finds matching template or searches web for one.
-    Returns questions to ask the user.
-    """
-    try:
-        # Search for matching template
-        template = db.find_template_by_matter_type(request.matter_type)
+# @app.post("/draft/start")
+# async def start_draft(request: DraftRequest):
+#     """
+#     Start a new draft session. Finds matching template or searches web for one.
+#     Returns questions to ask the user.
+#     """
+#     try:
+#         # Search for matching template
+#         template = db.find_template_by_matter_type(request.matter_type)
         
-        # If no template found, search the web
-        if not template:
-            search_result = await web_search.search_and_ingest_template(
-                matter_type=request.matter_type
-            )
+#         # If no template found, search the web
+#         if not template:
+#             search_result = await web_search.search_and_ingest_template(
+#                 matter_type=request.matter_type
+#             )
             
-            if search_result:
-                # Process the found document
-                text = doc_processor.extract_text(
-                    search_result["content"],
-                    search_result["content_type"]
-                )
+#             if search_result:
+#                 # Process the found document
+#                 text = doc_processor.extract_text(
+#                     search_result["content"],
+#                     search_result["content_type"]
+#                 )
                 
-                template_result = template_engine.convert_to_template(text)
-                variables = template_engine.extract_variables(template_result["markdown"])
+#                 template_result = template_engine.convert_to_template(text)
+#                 variables = template_engine.extract_variables(template_result["markdown"])
                 
-                template = db.create_template(
-                    name=f"{request.matter_type} Template",
-                    matter_type=request.matter_type,
-                    description=template_result.get("description", ""),
-                    markdown_content=template_result["markdown"],
-                    variables=variables
-                )
-            else:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No template found for matter type '{request.matter_type}' and web search failed"
-                )
+#                 template = db.create_template(
+#                     name=f"{request.matter_type} Template",
+#                     matter_type=request.matter_type,
+#                     description=template_result.get("description", ""),
+#                     markdown_content=template_result["markdown"],
+#                     variables=variables
+#                 )
+#             else:
+#                 raise HTTPException(
+#                     status_code=404,
+#                     detail=f"No template found for matter type '{request.matter_type}' and web search failed"
+#                 )
         
-        # Create draft session
-        session = db.create_draft_session(
-            template_id=template.id,
-            context=request.context
-        )
+#         # Create draft session
+#         session = db.create_draft_session(
+#             template_id=template.id,
+#             context=request.context
+#         )
         
-        # Generate human-friendly questions
-        questions = question_gen.generate_questions(
-            template.variables,
-            prefilled=request.context
-        )
+#         # Generate human-friendly questions
+#         questions = question_gen.generate_questions(
+#             template.variables,
+#             prefilled=request.context
+#         )
         
-        return {
-            "session_id": session.id,
-            "template_id": template.id,
-            "template_name": template.name,
-            "questions": [QuestionResponse(**q) for q in questions]
-        }
+#         return {
+#             "session_id": session.id,
+#             "template_id": template.id,
+#             "template_name": template.name,
+#             "questions": [QuestionResponse(**q) for q in questions]
+#         }
     
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error starting draft: {str(e)}")
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error starting draft: {str(e)}")
 
 
-@app.post("/draft/answer")
-async def submit_answers(submission: AnswerSubmission):
-    """
-    Submit answers for a draft session. Returns next questions or generates final draft.
-    """
-    try:
-        # Get session
-        session = db.get_draft_session(submission.session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
+# @app.post("/draft/answer")
+# async def submit_answers(submission: AnswerSubmission):
+#     """
+#     Submit answers for a draft session. Returns next questions or generates final draft.
+#     """
+#     try:
+#         # Get session
+#         session = db.get_draft_session(submission.session_id)
+#         if not session:
+#             raise HTTPException(status_code=404, detail="Session not found")
         
-        # Update session with answers
-        db.update_session_answers(submission.session_id, submission.answers)
+#         # Update session with answers
+#         db.update_session_answers(submission.session_id, submission.answers)
         
-        # Get template
-        template = db.get_template(session.template_id)
+#         # Get template
+#         template = db.get_template(session.template_id)
         
-        # Check if all required variables are filled
-        missing_vars = template_engine.get_missing_variables(
-            template.variables,
-            {**session.context, **submission.answers}
-        )
+#         # Check if all required variables are filled
+#         missing_vars = template_engine.get_missing_variables(
+#             template.variables,
+#             {**session.context, **submission.answers}
+#         )
         
-        if missing_vars:
-            # Generate questions for missing variables
-            questions = question_gen.generate_questions(
-                missing_vars,
-                prefilled={**session.context, **submission.answers}
-            )
+#         if missing_vars:
+#             # Generate questions for missing variables
+#             questions = question_gen.generate_questions(
+#                 missing_vars,
+#                 prefilled={**session.context, **submission.answers}
+#             )
             
-            return {
-                "session_id": session.id,
-                "status": "pending",
-                "questions": [QuestionResponse(**q) for q in questions]
-            }
-        else:
-            # All variables filled - generate draft
-            all_values = {**session.context, **submission.answers}
-            draft = template_engine.generate_draft(
-                template.markdown_content,
-                all_values
-            )
+#             return {
+#                 "session_id": session.id,
+#                 "status": "pending",
+#                 "questions": [QuestionResponse(**q) for q in questions]
+#             }
+#         else:
+#             # All variables filled - generate draft
+#             all_values = {**session.context, **submission.answers}
+#             draft = template_engine.generate_draft(
+#                 template.markdown_content,
+#                 all_values
+#             )
             
-            # Update session as completed
-            db.complete_session(submission.session_id, draft["markdown"])
+#             # Update session as completed
+#             db.complete_session(submission.session_id, draft["markdown"])
             
-            return DraftResponse(
-                session_id=session.id,
-                template_id=template.id,
-                markdown_draft=draft["markdown"],
-                html_draft=draft.get("html"),
-                completed_at=datetime.utcnow()
-            )
+#             return DraftResponse(
+#                 session_id=session.id,
+#                 template_id=template.id,
+#                 markdown_draft=draft["markdown"],
+#                 html_draft=draft.get("html"),
+#                 completed_at=datetime.utcnow()
+#             )
     
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error submitting answers: {str(e)}")
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error submitting answers: {str(e)}")
 
 
-@app.get("/templates", response_model=List[TemplateResponse])
-async def list_templates(matter_type: Optional[str] = None):
-    """
-    List all available templates, optionally filtered by matter type.
-    """
-    templates = db.list_templates(matter_type=matter_type)
-    return [
-        TemplateResponse(
-            id=t.id,
-            name=t.name,
-            matter_type=t.matter_type,
-            description=t.description,
-            variables=[VariableResponse(**var) for var in t.variables],
-            markdown_content=t.markdown_content,
-            created_at=t.created_at
-        )
-        for t in templates
-    ]
+# @app.get("/templates", response_model=List[TemplateResponse])
+# async def list_templates(matter_type: Optional[str] = None):
+#     """
+#     List all available templates, optionally filtered by matter type.
+#     """
+#     templates = db.list_templates(matter_type=matter_type)
+#     return [
+#         TemplateResponse(
+#             id=t.id,
+#             name=t.name,
+#             matter_type=t.matter_type,
+#             description=t.description,
+#             variables=[VariableResponse(**var) for var in t.variables],
+#             markdown_content=t.markdown_content,
+#             created_at=t.created_at
+#         )
+#         for t in templates
+#     ]
 
 
-@app.get("/templates/{template_id}", response_model=TemplateResponse)
-async def get_template(template_id: str):
-    """
-    Get a specific template by ID.
-    """
-    template = db.get_template(template_id)
-    if not template:
-        raise HTTPException(status_code=404, detail="Template not found")
+# @app.get("/templates/{template_id}", response_model=TemplateResponse)
+# async def get_template(template_id: str):
+#     """
+#     Get a specific template by ID.
+#     """
+#     template = db.get_template(template_id)
+#     if not template:
+#         raise HTTPException(status_code=404, detail="Template not found")
     
-    return TemplateResponse(
-        id=template.id,
-        name=template.name,
-        matter_type=template.matter_type,
-        description=template.description,
-        variables=[VariableResponse(**var) for var in template.variables],
-        markdown_content=template.markdown_content,
-        created_at=template.created_at
-    )
+#     return TemplateResponse(
+#         id=template.id,
+#         name=template.name,
+#         matter_type=template.matter_type,
+#         description=template.description,
+#         variables=[VariableResponse(**var) for var in template.variables],
+#         markdown_content=template.markdown_content,
+#         created_at=template.created_at
+#     )
 
 
-@app.get("/sessions/{session_id}")
-async def get_session(session_id: str):
-    """
-    Get draft session details and current state.
-    """
-    session = db.get_draft_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+# @app.get("/sessions/{session_id}")
+# async def get_session(session_id: str):
+#     """
+#     Get draft session details and current state.
+#     """
+#     session = db.get_draft_session(session_id)
+#     if not session:
+#         raise HTTPException(status_code=404, detail="Session not found")
     
-    return {
-        "session_id": session.id,
-        "template_id": session.template_id,
-        "status": session.status,
-        "context": session.context,
-        "created_at": session.created_at,
-        "completed_at": session.completed_at
-    }
+#     return {
+#         "session_id": session.id,
+#         "template_id": session.template_id,
+#         "status": session.status,
+#         "context": session.context,
+#         "created_at": session.created_at,
+#         "completed_at": session.completed_at
+#     }
 
 
 @app.get("/health")
