@@ -1,21 +1,19 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
-from enum import Enum
 import uvicorn
 import os
 import tempfile
 import mimetypes
 import pathlib
+from .models.schemas import VariableType, VariableResponse, TemplateResponse, DraftRequest
 from datetime import datetime
 
 # ---- external modules (your own packages) ----
-from document_processor import DocumentProcessor
-from template_engine import TemplateEngine
-from db import Database, Template, Variable, DraftSession
-from question_generator import QuestionGenerator
-from web_search import WebSearchService
+from .services.document_processor import DocumentProcessor
+from .services.template_engine import TemplateEngine
+from .services.db import Database, Template, Variable, DraftSession
+from .services.question_generator import QuestionGenerator
+from .services.web_search import WebSearchService
 
 # ---- optional Gemini integration ----
 from google import genai
@@ -34,45 +32,11 @@ web_search = WebSearchService()
 app = FastAPI(
     title="Legal Document Drafting System",
     description="AI-powered legal document templating and drafting service",
-    version="0.0.2",
+    version="0.0.1",
 )
 
-# =============== Pydantic Models ===============
-class VariableType(str, Enum):
-    TEXT = "text"
-    DATE = "date"
-    NUMBER = "number"
-    EMAIL = "email"
-    ADDRESS = "address"
-    CHOICE = "choice"
 
 
-class VariableResponse(BaseModel):
-    id: str
-    name: str
-    description: str
-    type: VariableType
-    examples: List[str] = []
-    constraints: Optional[Dict[str, Any]] = None
-    required: bool = True
-
-
-class TemplateResponse(BaseModel):
-    id: str
-    name: str
-    matter_type: str
-    description: str
-    variables: List[VariableResponse]
-    markdown_content: str
-    created_at: datetime
-
-
-class DraftRequest(BaseModel):
-    matter_type: str
-    context: Optional[Dict[str, Any]] = Field(default_factory=dict)
-
-
-# =============== Helper function for MIME type ===============
 def get_file_mime_type(file: UploadFile) -> str:
     if file.content_type:
         return file.content_type
@@ -80,9 +44,6 @@ def get_file_mime_type(file: UploadFile) -> str:
     return mime or "application/octet-stream"
 
 
-# =============================================================
-#                 UPLOAD ENDPOINT (WITH FIXED FILE HANDLING)
-# =============================================================
 @app.post("/upload", response_model=TemplateResponse)
 async def upload_document(
     file: UploadFile = File(...),
@@ -123,7 +84,6 @@ async def upload_document(
             # not fatal for DOCX (Gemini doesn't support DOCX)
             print(f"[Gemini] Skipped: {gemini_error}")
 
-        # --- Your document-processing logic ---
         text = doc_processor.extract_text(file_bytes, mime_type)
 
         template_result = template_engine.convert_to_template(text)
@@ -155,7 +115,6 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
 
     finally:
-        # --- cleanup Gemini & temp file ---
         if uploaded_file:
             try:
                 client.files.delete(name=uploaded_file.name)
