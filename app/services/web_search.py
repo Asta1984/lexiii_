@@ -1,6 +1,6 @@
 from exa_py import Exa
 from typing import Optional, Dict, Any
-from config import EXA_API_KEY
+from app.config import EXA_API_KEY
 
 class WebSearchService:
     """Service to search the web for legal templates using the Exa API."""

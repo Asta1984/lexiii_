@@ -10,4 +10,5 @@ pydantic-settings
 python-dotenv
 exa-py
 google-genai
+pinecone
 

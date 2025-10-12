@@ -7,6 +7,8 @@ import mimetypes
 import pathlib
 from .models.schemas import VariableType, VariableResponse, TemplateResponse, DraftRequest
 from datetime import datetime
+from typing import Optional, List
+
 
 # ---- external modules (your own packages) ----
 from .services.document_processor import DocumentProcessor
@@ -18,7 +20,7 @@ from .services.web_search import WebSearchService
 # ---- optional Gemini integration ----
 from google import genai
 from google.genai import types
-from config import GOOGLE_API_KEY
+from app.config import GOOGLE_API_KEY
 import time
 
 # =============== Initialize services and app ===============

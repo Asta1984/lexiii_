@@ -5,7 +5,7 @@ import re
 import uuid
 import markdown
 from typing import List, Dict, Any
-from config import GOOGLE_API_KEY
+from app.config import GOOGLE_API_KEY
 
 class TemplateEngine:
     """Uses the updated Gemini API SDK for templating, variable extraction, and drafting."""
