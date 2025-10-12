@@ -4,8 +4,7 @@ import uuid
 from typing import List, Dict, Any, Optional
 import json
 from datetime import datetime
-from pinecone import Pinecone, ServerlessSpec, Index
-from pinecone import exceptions as pinecone_exceptions
+from pinecone import Pinecone, ServerlessSpec
 from google import genai
 from app.config import GOOGLE_API_KEY, PINECONE_API_KEY, PINECONE_ENV
 
@@ -72,25 +71,29 @@ class PineconeDatabase:
         self._ensure_index_exists()
         
         # Connect to the index once
-        self.template_index: Index = self.pc.Index(self.TEMPLATE_INDEX_NAME)
+        self.template_index = self.pc.Index(self.TEMPLATE_INDEX_NAME)
 
     def _ensure_index_exists(self):
         """Creates the main index if it does not already exist."""
-        if self.TEMPLATE_INDEX_NAME not in self.pc.list_indexes().names:
-            print(f"Creating Pinecone index: {self.TEMPLATE_INDEX_NAME}...")
-            # Using ServerlessSpec for modern, cost-effective deployment
-            self.pc.create_index(
-                name=self.TEMPLATE_INDEX_NAME,
-                dimension=self.EMBEDDING_DIMENSION,
-                metric='cosine',
-                spec=ServerlessSpec(cloud='aws', region='us-east-1') # Adjust cloud/region as needed
-            )
-            # Wait for index to be initialized
-            while not self.pc.Index(self.TEMPLATE_INDEX_NAME).describe_index_stats().get('namespaces'):
-                time.sleep(1)
-            print(f"Index {self.TEMPLATE_INDEX_NAME} created and ready.")
-        else:
-            print(f"Pinecone index {self.TEMPLATE_INDEX_NAME} already exists.")
+        try:
+            # Extract index names from list_indexes() response
+            existing_indexes = [idx.name for idx in self.pc.list_indexes()]
+            
+            if self.TEMPLATE_INDEX_NAME not in existing_indexes:
+                print(f"Creating Pinecone index: {self.TEMPLATE_INDEX_NAME}...")
+                spec = ServerlessSpec(cloud='aws', region='us-east-1')
+                self.pc.create_index(
+                    name=self.TEMPLATE_INDEX_NAME,
+                    dimension=self.EMBEDDING_DIMENSION,
+                    metric='cosine',
+                    spec=spec
+                )
+                print(f"Index {self.TEMPLATE_INDEX_NAME} created successfully.")
+            else:
+                print(f"Pinecone index {self.TEMPLATE_INDEX_NAME} already exists.")
+        except Exception as e:
+            print(f"Error checking/creating index: {e}")
+            raise
 
     # ==================== TEMPLATE CRUD & SEARCH (Vector Store) ====================
 
@@ -219,7 +222,7 @@ class PineconeDatabase:
         Uses a zero-vector since no semantic search is needed here.
         """
         session_id = str(uuid.uuid4())
-        created_at = datetime.utcnow().isoformat()
+        created_at = datetime.now().isoformat()
 
         # Store filled_values and template_id in metadata
         metadata = {

@@ -13,9 +13,9 @@ from typing import Optional, List
 # ---- external modules (your own packages) ----
 from .services.document_processor import DocumentProcessor
 from .services.template_engine import TemplateEngine
-from .services.db import Database, Template, Variable, DraftSession
 from .services.question_generator import QuestionGenerator
 from .services.web_search import WebSearchService
+from .services.pinecone_service import PineconeDatabase
 
 # ---- optional Gemini integration ----
 from google import genai
@@ -25,7 +25,7 @@ import time
 
 # =============== Initialize services and app ===============
 client = genai.Client(api_key=GOOGLE_API_KEY)
-db = Database()
+db = PineconeDatabase()
 doc_processor = DocumentProcessor()
 template_engine = TemplateEngine()
 question_gen = QuestionGenerator()
