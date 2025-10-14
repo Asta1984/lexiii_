@@ -1,29 +1,30 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
 import os
 import tempfile
 import mimetypes
 import pathlib
-from .models.schemas import VariableType, VariableResponse, TemplateResponse, DraftRequest
 from datetime import datetime
 from typing import Optional, List
 
+from app.models.schemas import (
+    VariableSchema, TemplateResponse, DraftRequest, QuestionResponse,
+    AnswerSubmission, DraftResponse, TemplateMatchCard, TemplateSelectionResponse,
+    UploadResponse
+)
+from app.services.document_processor import DocumentProcessor
+from app.services.template_engine import TemplateEngine
+from app.services.question_generator import QuestionGenerator
+from app.services.web_search import WebSearchService
+from app.services.pinecone_service import PineconeDatabase
 
-# ---- external modules (your own packages) ----
-from .services.document_processor import DocumentProcessor
-from .services.template_engine import TemplateEngine
-from .services.question_generator import QuestionGenerator
-from .services.web_search import WebSearchService
-from .services.pinecone_service import PineconeDatabase
-
-# ---- optional Gemini integration ----
 from google import genai
-from google.genai import types
 from app.config import GOOGLE_API_KEY
-import time
 
-# =============== Initialize services and app ===============
+
+# ==================== INITIALIZATION ====================
+
 client = genai.Client(api_key=GOOGLE_API_KEY)
 db = PineconeDatabase()
 doc_processor = DocumentProcessor()
@@ -33,288 +34,357 @@ web_search = WebSearchService()
 
 app = FastAPI(
     title="Legal Document Drafting System",
-    description="AI-powered legal document templating and drafting service",
+    description="Gemini-powered legal document templatization, Q&A drafting, and vector retrieval using Pinecone.",
     version="0.0.1",
+    contact={
+        "name": "Salil Mandal",
+        "email": "salilmandal908@gmail.com"
+    },
+    license_info={
+        "name": "MIT License",
+        "url": "https://opensource.org/licenses/MIT"
+    },
 )
 
-
-
 def get_file_mime_type(file: UploadFile) -> str:
+    """Safely determine MIME type for upload."""
     if file.content_type:
         return file.content_type
     mime, _ = mimetypes.guess_type(file.filename)
     return mime or "application/octet-stream"
 
 
-@app.post("/upload", response_model=TemplateResponse)
-async def upload_document(
-    file: UploadFile = File(...),
-    matter_type: Optional[str] = None,):
+# ==================== ENDPOINTS ====================
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_document(file: UploadFile = File(...)):
+    """Phase 1: Upload document → extract → templatize → store in Pinecone."""
     mime_type = get_file_mime_type(file)
     allowed = [
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ]
     if mime_type not in allowed:
-        raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported.")
+        raise HTTPException(status_code=400, detail="Only PDF and DOCX files supported")
 
     temp_file_path = None
     uploaded_file = None
-    try:
-        # Read file bytes
-        file_bytes = await file.read()
 
-        # --- correct file handling: save to a temp file ---
+    try:
+        file_bytes = await file.read()
         suffix = os.path.splitext(file.filename)[1] or ".bin"
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(file_bytes)
             temp_file_path = tmp.name
 
         file_path = pathlib.Path(temp_file_path)
 
-        # --- If you want to optionally process with Gemini ---
+        #Optional: Upload to Gemini for preview or caching
         try:
             uploaded_file = client.files.upload(file=file_path)
-            # wait for activation
             for _ in range(30):
                 if uploaded_file.state.name != "PROCESSING":
                     break
+                import time
                 time.sleep(2)
                 uploaded_file = client.files.get(uploaded_file.name)
-            print(f"[Gemini] File uploaded, state: {uploaded_file.state.name}")
-        except Exception as gemini_error:
-            # not fatal for DOCX (Gemini doesn't support DOCX)
-            print(f"[Gemini] Skipped: {gemini_error}")
+        except Exception as e:
+            print(f"[Gemini Upload] Skipped: {e}")
 
+        #Extract text
         text = doc_processor.extract_text(file_bytes, mime_type)
 
-        template_result = template_engine.convert_to_template(text)
+        #Convert to Markdown template with YAML metadata
+        template_result = template_engine.convert_to_template(text, file.filename)
+        metadata = template_result["metadata"]
+        markdown = template_result["markdown"]
+        variables = [VariableSchema(**v) for v in metadata["variables"]]
 
-        if not matter_type:
-            matter_type = template_engine.detect_matter_type(text)
-
-        variables = template_engine.extract_variables(template_result["markdown"])
-
+        # Store in Pinecone vector DB
         template = db.create_template(
-            name=file.filename.rsplit(".", 1)[0],
-            matter_type=matter_type,
-            description=template_result.get("description", ""),
-            markdown_content=template_result["markdown"],
-            variables=variables,
+            template_id=metadata["template_id"],
+            title=metadata["title"],
+            doc_type=metadata["doc_type"],
+            jurisdiction=metadata["jurisdiction"],
+            description=metadata["file_description"],
+            markdown_content=markdown,
+            variables=metadata["variables"],
+            similarity_tags=metadata["similarity_tags"],
+            embedding_text=f"{metadata['doc_type']} {metadata['jurisdiction']} {metadata['file_description']}"
         )
 
-        return TemplateResponse(
-            id=template.id,
-            name=template.name,
-            matter_type=template.matter_type,
+        return UploadResponse(
+            template_id=template.id,
+            title=template.name,
+            doc_type=template.matter_type,
+            jurisdiction=template.jurisdiction,
             description=template.description,
-            variables=[VariableResponse(**var) for var in template.variables],
-            markdown_content=template.markdown_content,
-            created_at=template.created_at,
+            variables=variables,
+            similarity_tags=template.similarity_tags,
+            message=f"Template saved: {template.id}"
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
 
     finally:
+        # Cleanup Gemini and temp files
         if uploaded_file:
             try:
                 client.files.delete(name=uploaded_file.name)
-            except Exception:
+            except:
                 pass
         if temp_file_path and os.path.exists(temp_file_path):
             try:
                 os.unlink(temp_file_path)
-                print(f"[Cleanup] Deleted temp file {temp_file_path}")
-            except Exception:
+            except:
                 pass
 
-# @app.post("/draft/start")
-# async def start_draft(request: DraftRequest):
-#     """
-#     Start a new draft session. Finds matching template or searches web for one.
-#     Returns questions to ask the user.
-#     """
-#     try:
-#         # Search for matching template
-#         template = db.find_template_by_matter_type(request.matter_type)
-        
-#         # If no template found, search the web
-#         if not template:
-#             search_result = await web_search.search_and_ingest_template(
-#                 matter_type=request.matter_type
-#             )
-            
-#             if search_result:
-#                 # Process the found document
-#                 text = doc_processor.extract_text(
-#                     search_result["content"],
-#                     search_result["content_type"]
-#                 )
-                
-#                 template_result = template_engine.convert_to_template(text)
-#                 variables = template_engine.extract_variables(template_result["markdown"])
-                
-#                 template = db.create_template(
-#                     name=f"{request.matter_type} Template",
-#                     matter_type=request.matter_type,
-#                     description=template_result.get("description", ""),
-#                     markdown_content=template_result["markdown"],
-#                     variables=variables
-#                 )
-#             else:
-#                 raise HTTPException(
-#                     status_code=404,
-#                     detail=f"No template found for matter type '{request.matter_type}' and web search failed"
-#                 )
-        
-#         # Create draft session
-#         session = db.create_draft_session(
-#             template_id=template.id,
-#             context=request.context
-#         )
-        
-#         # Generate human-friendly questions
-#         questions = question_gen.generate_questions(
-#             template.variables,
-#             prefilled=request.context
-#         )
-        
-#         return {
-#             "session_id": session.id,
-#             "template_id": template.id,
-#             "template_name": template.name,
-#             "questions": [QuestionResponse(**q) for q in questions]
-#         }
-    
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Error starting draft: {str(e)}")
+
+@app.post("/draft/start", response_model=TemplateSelectionResponse)
+async def start_draft(request: DraftRequest):
+    """
+    Phase 2 (Step 1): User asks e.g. "Draft a notice to insurer in India"
+    → Find best-matching local template via Pinecone
+    → If none found, bootstrap from web using Exa API
+    """
+    try:
+        # Try local semantic search
+        search_results = db.search_templates(request.user_ask)
+
+        if search_results:
+            match_cards = []
+            for result in search_results:
+                template = result["template"]
+                score = result.get("score", 0.0)
+                match_cards.append(
+                    TemplateMatchCard(
+                        template_id=template.id,
+                        title=template.name,
+                        doc_type=template.matter_type,
+                        jurisdiction=template.jurisdiction,
+                        match_score=round(score, 3),
+                        reason="Semantic match from Pinecone index",
+                        similarity_tags=template.similarity_tags,
+                    )
+                )
+
+            top_match = match_cards[0]
+            alternatives = match_cards[1:3] if len(match_cards) > 1 else []
+
+            return TemplateSelectionResponse(
+                top_match=top_match,
+                alternatives=alternatives
+            )
+
+        #  No local match → bootstrap from web
+        print("[Retrieval] No local templates found. Searching web...")
+        web_result = await web_search.search_and_ingest_template(request.user_ask)
+
+        if web_result:
+            text = doc_processor.extract_text(web_result["content"], "text/plain")
+            template_result = template_engine.convert_to_template(text, "web_template")
+
+            metadata = template_result["metadata"]
+            markdown = template_result["markdown"]
+            variables = [VariableSchema(**v) for v in metadata["variables"]]
+
+            # Save web-found template in Pinecone
+            template = db.create_template(
+                template_id=metadata["template_id"],
+                title=metadata["title"],
+                doc_type=metadata["doc_type"],
+                jurisdiction=metadata["jurisdiction"],
+                description=metadata["file_description"],
+                markdown_content=markdown,
+                variables=metadata["variables"],
+                similarity_tags=metadata["similarity_tags"],
+                embedding_text=f"{metadata['doc_type']} {metadata['jurisdiction']} {metadata['file_description']}"
+            )
+
+            match_card = TemplateMatchCard(
+                template_id=template.id,
+                title=template.name,
+                doc_type=template.matter_type,
+                jurisdiction=template.jurisdiction,
+                match_score=0.95,
+                reason="Bootstrap via web search",
+                similarity_tags=template.similarity_tags
+            )
+
+            return TemplateSelectionResponse(
+                top_match=match_card,
+                alternatives=[]
+            )
+
+        raise HTTPException(
+            status_code=404,
+            detail="No suitable template found locally or via web."
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error starting draft: {str(e)}")
 
 
-# @app.post("/draft/answer")
-# async def submit_answers(submission: AnswerSubmission):
-#     """
-#     Submit answers for a draft session. Returns next questions or generates final draft.
-#     """
-#     try:
-#         # Get session
-#         session = db.get_draft_session(submission.session_id)
-#         if not session:
-#             raise HTTPException(status_code=404, detail="Session not found")
-        
-#         # Update session with answers
-#         db.update_session_answers(submission.session_id, submission.answers)
-        
-#         # Get template
-#         template = db.get_template(session.template_id)
-        
-#         # Check if all required variables are filled
-#         missing_vars = template_engine.get_missing_variables(
-#             template.variables,
-#             {**session.context, **submission.answers}
-#         )
-        
-#         if missing_vars:
-#             # Generate questions for missing variables
-#             questions = question_gen.generate_questions(
-#                 missing_vars,
-#                 prefilled={**session.context, **submission.answers}
-#             )
-            
-#             return {
-#                 "session_id": session.id,
-#                 "status": "pending",
-#                 "questions": [QuestionResponse(**q) for q in questions]
-#             }
-#         else:
-#             # All variables filled - generate draft
-#             all_values = {**session.context, **submission.answers}
-#             draft = template_engine.generate_draft(
-#                 template.markdown_content,
-#                 all_values
-#             )
-            
-#             # Update session as completed
-#             db.complete_session(submission.session_id, draft["markdown"])
-            
-#             return DraftResponse(
-#                 session_id=session.id,
-#                 template_id=template.id,
-#                 markdown_draft=draft["markdown"],
-#                 html_draft=draft.get("html"),
-#                 completed_at=datetime.utcnow()
-#             )
-    
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Error submitting answers: {str(e)}")
+@app.post("/draft/questions")
+async def get_questions(request: DraftRequest):
+    """Phase 2 (Step 2): Generate polite questions for missing variables."""
+    template_id = request.context.get("template_id")
+    if not template_id:
+        raise HTTPException(status_code=400, detail="template_id required in context")
+
+    try:
+        # Create or resume session
+        session = db.create_draft_session(template_id, request.context)
+
+        # Retrieve template
+        template = db.get_template_by_id(template_id, "IN")
+        if not template:
+            raise HTTPException(status_code=404, detail="Template not found")
+
+        variables = [VariableSchema(**v) for v in template.variables]
+
+        # Prefill obvious fields
+        prefilled = db.extract_prefilled_values(request.user_ask, [v.dict() for v in variables])
+
+        # Determine missing fields
+        missing = template_engine.get_missing_variables([v.dict() for v in variables], prefilled)
+
+        # Generate questions for missing
+        questions = question_gen.generate_questions(missing, prefilled)
+
+        # Update session
+        db.update_draft_session(session.session_id, prefilled)
+
+        return {
+            "session_id": session.session_id,
+            "template_id": template_id,
+            "template_title": template.name,
+            "filled": len(prefilled),
+            "missing": len(missing),
+            "questions": [
+                QuestionResponse(
+                    variable_key=q["variable_key"],
+                    question=q["question"],
+                    dtype=q["dtype"],
+                    example=q["example"],
+                    help_text=q.get("help_text")
+                )
+                for q in questions
+            ]
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating questions: {str(e)}")
 
 
-# @app.get("/templates", response_model=List[TemplateResponse])
-# async def list_templates(matter_type: Optional[str] = None):
-#     """
-#     List all available templates, optionally filtered by matter type.
-#     """
-#     templates = db.list_templates(matter_type=matter_type)
-#     return [
-#         TemplateResponse(
-#             id=t.id,
-#             name=t.name,
-#             matter_type=t.matter_type,
-#             description=t.description,
-#             variables=[VariableResponse(**var) for var in t.variables],
-#             markdown_content=t.markdown_content,
-#             created_at=t.created_at
-#         )
-#         for t in templates
-#     ]
+@app.post("/draft/answer", response_model=DraftResponse)
+async def submit_answers(submission: AnswerSubmission):
+    """Phase 2 (Step 3): Submit answers → draft full document or continue Q&A."""
+    try:
+        session = db.get_draft_session(submission.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        db.update_draft_session(submission.session_id, submission.answers)
+        session = db.get_draft_session(submission.session_id)
+
+        template = db.get_template_by_id(session.template_id, "IN")
+        if not template:
+            raise HTTPException(status_code=404, detail="Template not found")
+
+        variables = [VariableSchema(**v) for v in template.variables]
+        missing = template_engine.get_missing_variables([v.dict() for v in variables], session.filled_values)
+
+        if missing:
+            questions = question_gen.generate_questions(missing, session.filled_values)
+            return {
+                "session_id": submission.session_id,
+                "status": "pending",
+                "questions": [
+                    QuestionResponse(
+                        variable_key=q["variable_key"],
+                        question=q["question"],
+                        dtype=q["dtype"],
+                        example=q["example"],
+                        help_text=q.get("help_text")
+                    )
+                    for q in questions
+                ]
+            }
+
+        # All filled → generate final draft
+        draft = template_engine.generate_draft(template.markdown_content, session.filled_values)
+        db.update_draft_session(submission.session_id, {}, status="completed")
+
+        return DraftResponse(
+            session_id=submission.session_id,
+            template_id=template.id,
+            template_title=template.name,
+            markdown_draft=draft["markdown"],
+            html_draft=draft.get("html"),
+            completed_at=datetime.utcnow()
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error submitting answers: {str(e)}")
 
 
-# @app.get("/templates/{template_id}", response_model=TemplateResponse)
-# async def get_template(template_id: str):
-#     """
-#     Get a specific template by ID.
-#     """
-#     template = db.get_template(template_id)
-#     if not template:
-#         raise HTTPException(status_code=404, detail="Template not found")
-    
-#     return TemplateResponse(
-#         id=template.id,
-#         name=template.name,
-#         matter_type=template.matter_type,
-#         description=template.description,
-#         variables=[VariableResponse(**var) for var in template.variables],
-#         markdown_content=template.markdown_content,
-#         created_at=template.created_at
-#     )
+@app.get("/templates", response_model=List[TemplateResponse])
+async def list_templates(doc_type: Optional[str] = None, jurisdiction: Optional[str] = None):
+    """Admin endpoint: List all available templates."""
+    templates = db.list_templates()
+
+    if doc_type:
+        templates = [t for t in templates if t.get("doc_type") == doc_type]
+    if jurisdiction:
+        templates = [t for t in templates if t.get("jurisdiction") == jurisdiction]
+
+    return templates
 
 
-# @app.get("/sessions/{session_id}")
-# async def get_session(session_id: str):
-#     """
-#     Get draft session details and current state.
-#     """
-#     session = db.get_draft_session(session_id)
-#     if not session:
-#         raise HTTPException(status_code=404, detail="Session not found")
-    
-#     return {
-#         "session_id": session.id,
-#         "template_id": session.template_id,
-#         "status": session.status,
-#         "context": session.context,
-#         "created_at": session.created_at,
-#         "completed_at": session.completed_at
-#     }
+@app.get("/templates/{template_id}", response_model=TemplateResponse)
+async def get_template(template_id: str):
+    """Fetch specific template with metadata + content."""
+    template = db.get_template_by_id(template_id, "IN")
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+
+    return TemplateResponse(
+        id=template.id,
+        title=template.name,
+        jurisdiction=template.jurisdiction,
+        doc_type=template.matter_type,
+        description=template.description,
+        variables=[VariableSchema(**v) for v in template.variables],
+        markdown_content=template.markdown_content,
+        similarity_tags=template.similarity_tags,
+        created_at=template.created_at
+    )
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Fetch a draft session’s progress and current filled values."""
+    session = db.get_draft_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return {
+        "session_id": session.session_id,
+        "template_id": session.template_id,
+        "status": session.status,
+        "filled_values": session.filled_values,
+        "created_at": session.created_at,
+    }
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Simple health check."""
     return {"status": "healthy", "timestamp": datetime.now()}
 
 

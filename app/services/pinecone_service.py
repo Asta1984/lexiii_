@@ -10,9 +10,22 @@ from app.config import GOOGLE_API_KEY, PINECONE_API_KEY, PINECONE_ENV
 from .sqlite_service import SQLiteDatabase, DraftSession
 
 
+# ==================== DATA MODEL ====================
+
 class Template:
     """Data class for templates."""
-    def __init__(self, id: str, name: str, matter_type: str, description: str, markdown_content: str, variables: List[Dict], created_at: str):
+    def __init__(
+        self,
+        id: str,
+        name: str,
+        matter_type: str,
+        description: str,
+        markdown_content: str,
+        variables: List[Dict],
+        created_at: str,
+        jurisdiction: Optional[str] = None,
+        similarity_tags: Optional[List[str]] = None
+    ):
         self.id = id
         self.name = name
         self.matter_type = matter_type
@@ -20,7 +33,11 @@ class Template:
         self.markdown_content = markdown_content
         self.variables = variables
         self.created_at = created_at
+        self.jurisdiction = jurisdiction or "IN"
+        self.similarity_tags = similarity_tags or []
 
+
+# ==================== EMBEDDING SERVICE ====================
 
 class EmbeddingsService:
     """Manages the generation of text embeddings using the Gemini API."""
@@ -35,12 +52,15 @@ class EmbeddingsService:
             response = self.client.models.embed_content(
                 model=self.model_name,
                 contents=text,
-                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"))
+                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
+            )
             return response.embeddings[0].values
         except Exception as e:
-            print(f"Error generating embedding: {e}")
+            print(f"[Embeddings] Error generating embedding: {e}")
             raise
 
+
+# ==================== PINECONE DATABASE ====================
 
 class PineconeDatabase:
     """
@@ -62,78 +82,91 @@ class PineconeDatabase:
         self._ensure_index_exists()
         self.template_index = self.pc.Index(self.TEMPLATE_INDEX_NAME)
 
+    # ==================== INDEX MANAGEMENT ====================
+
     def _ensure_index_exists(self):
         """Creates the main index if it does not already exist."""
         try:
             existing_indexes = [idx.name for idx in self.pc.list_indexes()]
-            
             if self.TEMPLATE_INDEX_NAME not in existing_indexes:
                 print(f"Creating Pinecone index: {self.TEMPLATE_INDEX_NAME}...")
-                spec = ServerlessSpec(cloud='aws', region='us-east-1')
+                spec = ServerlessSpec(cloud="aws", region="us-east-1")
                 self.pc.create_index(
                     name=self.TEMPLATE_INDEX_NAME,
                     dimension=self.EMBEDDING_DIMENSION,
-                    metric='cosine',
+                    metric="cosine",
                     spec=spec
                 )
                 print(f"Index {self.TEMPLATE_INDEX_NAME} created successfully.")
             else:
                 print(f"Pinecone index {self.TEMPLATE_INDEX_NAME} already exists.")
         except Exception as e:
-            print(f"Error checking/creating index: {e}")
+            print(f"[Pinecone] Error checking/creating index: {e}")
             raise
 
-    # ==================== TEMPLATE CRUD & SEARCH (Vector Store) ====================
+    # ==================== TEMPLATE CRUD & SEARCH ====================
 
-    def create_template(self, name: str, matter_type: str, description: str, markdown_content: str, variables: List[Dict]) -> Template:
+    def create_template(
+        self,
+        template_id: str,
+        title: str,
+        doc_type: str,
+        jurisdiction: str,
+        description: str,
+        markdown_content: str,
+        variables: List[Dict],
+        similarity_tags: List[str],
+        embedding_text: str
+    ) -> Template:
         """Creates a new Template record, generates its embedding, and upserts it to Pinecone."""
-        template_id = str(uuid.uuid4())
         created_at = datetime.now().isoformat()
-        
-        embedding_text = f"Matter Type: {matter_type}. Description: {description}. Content Sample: {markdown_content[:500]}"
         vector = self.embed_service.embed_text(embedding_text)
 
         metadata = {
             "id": template_id,
-            "name": name,
-            "matter_type": matter_type,
+            "name": title,
+            "matter_type": doc_type,
+            "jurisdiction": jurisdiction,
             "description": description,
             "markdown_content": markdown_content,
             "created_at": created_at,
             "variables_json": json.dumps(variables),
+            "similarity_tags": similarity_tags,
         }
-        
+
         self.template_index.upsert(
             vectors=[
                 {
                     "id": template_id,
                     "values": vector,
-                    "metadata": metadata
+                    "metadata": metadata,
                 }
             ],
-            namespace=matter_type.lower().replace(" ", "-")
-        )
-        
-        return Template(
-            id=template_id, 
-            name=name, 
-            matter_type=matter_type, 
-            description=description, 
-            markdown_content=markdown_content, 
-            variables=variables, 
-            created_at=created_at
+            namespace=doc_type.lower().replace(" ", "-"),
         )
 
-    def find_closest_template(self, user_ask: str, k: int = 3) -> List[Template]:
-        """Performs a semantic search against the template index."""
+        return Template(
+            id=template_id,
+            name=title,
+            matter_type=doc_type,
+            description=description,
+            markdown_content=markdown_content,
+            variables=variables,
+            created_at=created_at,
+            jurisdiction=jurisdiction,
+            similarity_tags=similarity_tags,
+        )
+
+    def find_closest_template(self, user_ask: str, k: int = 3) -> List[Dict[str, Any]]:
+        """Performs a semantic search against the template index and returns results with scores."""
         query_vector = self.embed_service.embed_text(user_ask)
-        
+
         results = self.template_index.query(
             vector=query_vector,
             top_k=k,
             include_metadata=True
         )
-        
+
         templates = []
         for match in results.matches:
             metadata = match.metadata
@@ -142,26 +175,28 @@ class PineconeDatabase:
             except json.JSONDecodeError:
                 variables = []
 
-            templates.append(Template(
-                id=metadata["id"],
-                name=metadata["name"],
-                matter_type=metadata["matter_type"],
-                description=metadata["description"],
-                markdown_content=metadata["markdown_content"],
-                variables=variables,
-                created_at=metadata["created_at"]
-            ))
-            
+            templates.append({
+                "template": Template(
+                    id=metadata["id"],
+                    name=metadata["name"],
+                    matter_type=metadata.get("matter_type", ""),
+                    description=metadata.get("description", ""),
+                    markdown_content=metadata.get("markdown_content", ""),
+                    variables=variables,
+                    created_at=metadata.get("created_at", datetime.now().isoformat()),
+                    jurisdiction=metadata.get("jurisdiction", "IN"),
+                    similarity_tags=metadata.get("similarity_tags", [])
+                ),
+                "score": match.score
+            })
+
         return templates
 
     def get_template_by_id(self, template_id: str, matter_type: str) -> Optional[Template]:
         """Retrieves a template by ID from Pinecone."""
         namespace = matter_type.lower().replace(" ", "-")
-        fetch_result = self.template_index.fetch(
-            ids=[template_id], 
-            namespace=namespace
-        )
-        
+        fetch_result = self.template_index.fetch(ids=[template_id], namespace=namespace)
+
         if template_id in fetch_result.vectors:
             metadata = fetch_result.vectors[template_id].metadata
             try:
@@ -176,12 +211,38 @@ class PineconeDatabase:
                 description=metadata.get("description", ""),
                 markdown_content=metadata.get("markdown_content", ""),
                 variables=variables,
-                created_at=metadata.get("created_at", datetime.now().isoformat())
+                created_at=metadata.get("created_at", datetime.now().isoformat()),
+                jurisdiction=metadata.get("jurisdiction", "IN"),
+                similarity_tags=metadata.get("similarity_tags", [])
             )
         return None
 
-    # ==================== DRAFT SESSION CRUD (SQLite) ====================
-    
+    def list_templates(self) -> List[Dict[str, Any]]:
+        """Lists all templates stored in Pinecone (for admin/debug)."""
+        try:
+            index_stats = self.template_index.describe_index_stats()
+            templates = []
+            for ns, stats in index_stats.namespaces.items():
+                # Pinecone doesn't allow listing metadata directly, so we query a sample
+                result = self.template_index.query(vector=[0.0]*self.EMBEDDING_DIMENSION, top_k=50, namespace=ns, include_metadata=True)
+                for match in result.matches:
+                    m = match.metadata
+                    templates.append({
+                        "id": m.get("id"),
+                        "title": m.get("name"),
+                        "doc_type": m.get("matter_type"),
+                        "jurisdiction": m.get("jurisdiction", "IN"),
+                        "description": m.get("description", ""),
+                        "created_at": m.get("created_at"),
+                        "similarity_tags": m.get("similarity_tags", []),
+                    })
+            return templates
+        except Exception as e:
+            print(f"[Pinecone] Error listing templates: {e}")
+            return []
+
+    # ==================== DRAFT SESSION (SQLite) ====================
+
     def create_draft_session(self, template_id: str, initial_context: Dict[str, Any]) -> DraftSession:
         """Creates a new draft session using SQLite."""
         return self.sqlite_db.create_draft_session(template_id, initial_context)
@@ -201,3 +262,30 @@ class PineconeDatabase:
     def get_sessions_by_template(self, template_id: str) -> List[DraftSession]:
         """Retrieves all draft sessions for a template from SQLite."""
         return self.sqlite_db.get_sessions_by_template(template_id)
+
+    # ==================== RETRIEVAL HELPERS ====================
+
+    def search_templates(self, user_ask: str, k: int = 3):
+        """Wrapper for semantic search used by /draft/start."""
+        try:
+            return self.find_closest_template(user_ask, k)
+        except Exception as e:
+            print(f"[Retrieval] Error: {e}")
+            return []
+
+    def extract_prefilled_values(self, user_ask: str, variables: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Simple keyword-based prefill heuristic."""
+        prefilled = {}
+        ask_lower = user_ask.lower()
+        for v in variables:
+            key = v.get("key")
+            label = v.get("label", key).lower()
+            dtype = v.get("dtype", "str")
+            if label in ask_lower or key in ask_lower:
+                if dtype == "str":
+                    prefilled[key] = v.get("example", "Auto-filled from context")
+                elif dtype == "date":
+                    prefilled[key] = datetime.now().strftime("%Y-%m-%d")
+                else:
+                    prefilled[key] = v.get("example", "")
+        return prefilled
