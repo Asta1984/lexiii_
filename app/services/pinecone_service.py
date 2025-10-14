@@ -1,16 +1,18 @@
 import os
-import time
 import uuid
-from typing import List, Dict, Any, Optional
 import json
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pinecone import Pinecone, ServerlessSpec
 from google import genai
+from google.genai import types
 from app.config import GOOGLE_API_KEY, PINECONE_API_KEY, PINECONE_ENV
+from .sqlite_service import SQLiteDatabase, DraftSession
 
 
 class Template:
-    def __init__(self, id: str, name: str, matter_type: str, description: str, markdown_content: str, variables: List[Dict], created_at: Any):
+    """Data class for templates."""
+    def __init__(self, id: str, name: str, matter_type: str, description: str, markdown_content: str, variables: List[Dict], created_at: str):
         self.id = id
         self.name = name
         self.matter_type = matter_type
@@ -19,64 +21,50 @@ class Template:
         self.variables = variables
         self.created_at = created_at
 
-class DraftSession:
-    def __init__(self, session_id: str, template_id: str, filled_values: Dict[str, Any], status: str, created_at: Any):
-        self.session_id = session_id
-        self.template_id = template_id
-        self.filled_values = filled_values
-        self.status = status
-        self.created_at = created_at
-
 
 class EmbeddingsService:
     """Manages the generation of text embeddings using the Gemini API."""
     def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
-        # Using a reliable embedding model from Google
         self.model_name = "models/text-embedding-004"
-        self.dimension = 768  # The expected dimension for this model
+        self.dimension = 768
 
     def embed_text(self, text: str) -> List[float]:
         """Generates a dense vector embedding for a given text."""
         try:
             response = self.client.models.embed_content(
                 model=self.model_name,
-                content=text,
-                task_type="RETRIEVAL_DOCUMENT" # Suitable for document search
-            )
-            return response['embedding']
+                contents=text,
+                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"))
+            return response.embeddings[0].values
         except Exception as e:
             print(f"Error generating embedding: {e}")
-            # Return a zero vector as a safe fallback for ID lookups, though search will fail
-            return [0.0] * self.dimension
+            raise
 
 
 class PineconeDatabase:
     """
-    Pinecone-backed database service for Template storage (Vector Search) 
-    and Draft Session storage (Transactional Metadata).
+    Pinecone-backed database service for Template storage (Vector Search).
+    Uses separate SQLiteDatabase for Draft Session storage.
     """
 
-    # --- Configuration ---
     TEMPLATE_INDEX_NAME = "legal-templates"
-    DRAFT_NAMESPACE = "draft-sessions"
-    EMBEDDING_DIMENSION = 768 # Must match the model dimension (text-embedding-004 is 768)
+    EMBEDDING_DIMENSION = 768
 
-    def __init__(self):
+    def __init__(self, sqlite_db_path: str = "draft_sessions.db"):
         if not PINECONE_API_KEY:
-             raise ValueError("PINECONE_API_KEY not set in config.")
+            raise ValueError("PINECONE_API_KEY not set in config.")
         
         self.pc = Pinecone(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
         self.embed_service = EmbeddingsService(api_key=GOOGLE_API_KEY)
-        self._ensure_index_exists()
+        self.sqlite_db = SQLiteDatabase(db_path=sqlite_db_path)
         
-        # Connect to the index once
+        self._ensure_index_exists()
         self.template_index = self.pc.Index(self.TEMPLATE_INDEX_NAME)
 
     def _ensure_index_exists(self):
         """Creates the main index if it does not already exist."""
         try:
-            # Extract index names from list_indexes() response
             existing_indexes = [idx.name for idx in self.pc.list_indexes()]
             
             if self.TEMPLATE_INDEX_NAME not in existing_indexes:
@@ -98,19 +86,13 @@ class PineconeDatabase:
     # ==================== TEMPLATE CRUD & SEARCH (Vector Store) ====================
 
     def create_template(self, name: str, matter_type: str, description: str, markdown_content: str, variables: List[Dict]) -> Template:
-        """
-        Creates a new Template record, generates its embedding, and upserts it to Pinecone.
-        Variables are serialized into the metadata for easy retrieval.
-        """
+        """Creates a new Template record, generates its embedding, and upserts it to Pinecone."""
         template_id = str(uuid.uuid4())
         created_at = datetime.now().isoformat()
         
-        # 1. Generate text to embed (e.g., matter type + description + first part of content)
         embedding_text = f"Matter Type: {matter_type}. Description: {description}. Content Sample: {markdown_content[:500]}"
         vector = self.embed_service.embed_text(embedding_text)
 
-        # 2. Prepare metadata (must be a flat dictionary for Pinecone)
-        # Store essential fields for reconstruction and filtering
         metadata = {
             "id": template_id,
             "name": name,
@@ -118,11 +100,9 @@ class PineconeDatabase:
             "description": description,
             "markdown_content": markdown_content,
             "created_at": created_at,
-            # Serializing complex objects like 'variables' for storage
             "variables_json": json.dumps(variables),
         }
         
-        # 3. Upsert to Pinecone
         self.template_index.upsert(
             vectors=[
                 {
@@ -131,7 +111,7 @@ class PineconeDatabase:
                     "metadata": metadata
                 }
             ],
-            namespace=matter_type.lower().replace(" ", "-") # Use matter_type as namespace for partitioning
+            namespace=matter_type.lower().replace(" ", "-")
         )
         
         return Template(
@@ -145,22 +125,17 @@ class PineconeDatabase:
         )
 
     def find_closest_template(self, user_ask: str, k: int = 3) -> List[Template]:
-        """
-        Performs a semantic search against the template index.
-        """
+        """Performs a semantic search against the template index."""
         query_vector = self.embed_service.embed_text(user_ask)
         
-        # Query Pinecone
         results = self.template_index.query(
             vector=query_vector,
             top_k=k,
             include_metadata=True
-            # filter={} # Could add filters here if needed (e.g., by client_id)
         )
         
         templates = []
         for match in results.matches:
-            # Reconstruct the Template object from metadata
             metadata = match.metadata
             try:
                 variables = json.loads(metadata.get("variables_json", "[]"))
@@ -180,10 +155,7 @@ class PineconeDatabase:
         return templates
 
     def get_template_by_id(self, template_id: str, matter_type: str) -> Optional[Template]:
-        """
-        Retrieves a template by ID (using Pinecone's fetch, requires namespace).
-        We use the matter_type to determine the namespace.
-        """
+        """Retrieves a template by ID from Pinecone."""
         namespace = matter_type.lower().replace(" ", "-")
         fetch_result = self.template_index.fetch(
             ids=[template_id], 
@@ -208,99 +180,24 @@ class PineconeDatabase:
             )
         return None
 
-
-    # ==================== DRAFT SESSION CRUD (Metadata Store) ====================
-    # Draft sessions do not need vector search, so we'll store them as zero-vectors 
-    # to use Pinecone purely as a highly available, scalable metadata store.
+    # ==================== DRAFT SESSION CRUD (SQLite) ====================
     
-    # Pre-calculated zero vector for transactional storage
-    ZERO_VECTOR = [0.0] * EMBEDDING_DIMENSION 
-
     def create_draft_session(self, template_id: str, initial_context: Dict[str, Any]) -> DraftSession:
-        """
-        Creates a new draft session using the DRAFT_NAMESPACE.
-        Uses a zero-vector since no semantic search is needed here.
-        """
-        session_id = str(uuid.uuid4())
-        created_at = datetime.now().isoformat()
-
-        # Store filled_values and template_id in metadata
-        metadata = {
-            "session_id": session_id,
-            "template_id": template_id,
-            "status": "in_progress",
-            "created_at": created_at,
-            "filled_values_json": json.dumps(initial_context)
-        }
-        
-        self.template_index.upsert(
-            vectors=[
-                {
-                    "id": session_id,
-                    "values": self.ZERO_VECTOR, 
-                    "metadata": metadata
-                }
-            ],
-            namespace=self.DRAFT_NAMESPACE
-        )
-        
-        return DraftSession(
-            session_id=session_id,
-            template_id=template_id,
-            filled_values=initial_context,
-            status="in_progress",
-            created_at=created_at
-        )
+        """Creates a new draft session using SQLite."""
+        return self.sqlite_db.create_draft_session(template_id, initial_context)
 
     def get_draft_session(self, session_id: str) -> Optional[DraftSession]:
-        """Fetches a draft session by ID from the DRAFT_NAMESPACE."""
-        fetch_result = self.template_index.fetch(
-            ids=[session_id], 
-            namespace=self.DRAFT_NAMESPACE
-        )
-        
-        if session_id in fetch_result.vectors:
-            metadata = fetch_result.vectors[session_id].metadata
-            try:
-                filled_values = json.loads(metadata.get("filled_values_json", "{}"))
-            except json.JSONDecodeError:
-                filled_values = {}
+        """Fetches a draft session from SQLite."""
+        return self.sqlite_db.get_draft_session(session_id)
 
-            return DraftSession(
-                session_id=metadata["session_id"],
-                template_id=metadata["template_id"],
-                filled_values=filled_values,
-                status=metadata["status"],
-                created_at=metadata["created_at"]
-            )
-        return None
+    def update_draft_session(self, session_id: str, new_values: Dict[str, Any], status: str = "in_progress") -> Optional[DraftSession]:
+        """Updates a draft session in SQLite."""
+        return self.sqlite_db.update_draft_session(session_id, new_values, status)
 
-    def update_draft_session(self, session_id: str, new_values: Dict[str, Any], status: str = "in_progress"):
-        """Updates the filled values and status of an existing draft session."""
-        
-        # Fetch the existing session data to merge new values
-        existing_session = self.get_draft_session(session_id)
-        if not existing_session:
-            raise ValueError(f"Draft session {session_id} not found for update.")
+    def delete_draft_session(self, session_id: str) -> bool:
+        """Deletes a draft session from SQLite."""
+        return self.sqlite_db.delete_draft_session(session_id)
 
-        # Merge the new values into the existing ones
-        merged_values = {**existing_session.filled_values, **new_values}
-        
-        # Update metadata using the `update` operation
-        self.template_index.update(
-            id=session_id,
-            set_metadata={
-                "status": status,
-                "filled_values_json": json.dumps(merged_values)
-            },
-            namespace=self.DRAFT_NAMESPACE
-        )
-        
-        # Return the updated session object for convenience
-        return DraftSession(
-            session_id=session_id,
-            template_id=existing_session.template_id,
-            filled_values=merged_values,
-            status=status,
-            created_at=existing_session.created_at
-        )
+    def get_sessions_by_template(self, template_id: str) -> List[DraftSession]:
+        """Retrieves all draft sessions for a template from SQLite."""
+        return self.sqlite_db.get_sessions_by_template(template_id)

@@ -37,11 +37,13 @@ class TemplateEngine:
         """
         prompt = f"""
         Analyze the following legal document text. Your task is to:
-        1. Identify all specific details that are likely to change each time the document is used (e.g., names, dates, addresses, monetary amounts, specific terms).
-        2. Replace these details with clear, snake_case placeholders enclosed in double curly braces, like {{{{variable_name}}}}.
-        3. Generate a brief, one-sentence description of the document's purpose.
-        4. Return a single JSON object with two keys: "markdown" containing the templated text, and "description" containing the description.
 
+        1. You are a legal doc templating assistant. Identify reusable fields.
+        2. Identify all specific details that are likely to change each time the document is used (e.g., names, dates, addresses, monetary amounts, specific terms).
+        3. Replace these details with clear, snake_case placeholders enclosed in double curly braces, like {{variable_name}}.
+        4. Generate a brief, one-sentence description of the document's purpose.
+        5. Return a single JSON object with two keys: "markdown" containing the templated text, and "description" containing the description.
+        6. Deduplicate logically identical fields. Favor domain-generic names.
         DOCUMENT TEXT:
         ---
         {text[:4000]}
