@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, APIRouter
 from fastapi.responses import JSONResponse
 import uvicorn
 import os
@@ -11,7 +11,7 @@ from typing import Optional, List
 from app.models.schemas import (
     VariableSchema, TemplateResponse, DraftRequest, QuestionResponse,
     AnswerSubmission, DraftResponse, TemplateMatchCard, TemplateSelectionResponse,
-    UploadResponse
+    UploadResponse,TemplateListItem
 )
 from app.services.document_processor import DocumentProcessor
 from app.services.template_engine import TemplateEngine
@@ -93,13 +93,12 @@ async def upload_document(file: UploadFile = File(...)):
             print(f"[Gemini Upload] Skipped: {e}")
 
         #Extract text
-        text = doc_processor.extract_text(file_bytes, mime_type)
-
+        text = doc_processor.extract_text(content=file_bytes, content_type=mime_type, file_path=file_path)
         #Convert to Markdown template with YAML metadata
         template_result = template_engine.convert_to_template(text, file.filename)
         metadata = template_result["metadata"]
         markdown = template_result["markdown"]
-        variables = [VariableSchema(**v) for v in metadata["variables"]]
+        variables = metadata["variables"]
 
         # Store in Pinecone vector DB
         template = db.create_template(
@@ -333,9 +332,8 @@ async def submit_answers(submission: AnswerSubmission):
         raise HTTPException(status_code=500, detail=f"Error submitting answers: {str(e)}")
 
 
-@app.get("/templates", response_model=List[TemplateResponse])
+@app.get("/templates", response_model=List[TemplateListItem])
 async def list_templates(doc_type: Optional[str] = None, jurisdiction: Optional[str] = None):
-    """Admin endpoint: List all available templates."""
     templates = db.list_templates()
 
     if doc_type:
@@ -348,8 +346,7 @@ async def list_templates(doc_type: Optional[str] = None, jurisdiction: Optional[
 
 @app.get("/templates/{template_id}", response_model=TemplateResponse)
 async def get_template(template_id: str):
-    """Fetch specific template with metadata + content."""
-    template = db.get_template_by_id(template_id, "IN")
+    template = db.get_template_by_id(template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
 
@@ -362,7 +359,7 @@ async def get_template(template_id: str):
         variables=[VariableSchema(**v) for v in template.variables],
         markdown_content=template.markdown_content,
         similarity_tags=template.similarity_tags,
-        created_at=template.created_at
+        created_at=datetime.fromisoformat(template.created_at)
     )
 
 

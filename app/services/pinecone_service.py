@@ -10,7 +10,6 @@ from app.config import GOOGLE_API_KEY, PINECONE_API_KEY, PINECONE_ENV
 from .sqlite_service import SQLiteDatabase, DraftSession
 
 
-# ==================== DATA MODEL ====================
 
 class Template:
     """Data class for templates."""
@@ -69,6 +68,8 @@ class PineconeDatabase:
     """
 
     TEMPLATE_INDEX_NAME = "legal-templates"
+    TEMPLATE_NAMESPACE_NAME = "templates"
+
     EMBEDDING_DIMENSION = 768
 
     def __init__(self, sqlite_db_path: str = "draft_sessions.db"):
@@ -135,15 +136,9 @@ class PineconeDatabase:
         }
 
         self.template_index.upsert(
-            vectors=[
-                {
-                    "id": template_id,
-                    "values": vector,
-                    "metadata": metadata,
-                }
-            ],
-            namespace=doc_type.lower().replace(" ", "-"),
-        )
+        vectors=[{"id": template_id, "values": vector, "metadata": metadata}],
+        namespace=self.TEMPLATE_NAMESPACE_NAME,)
+
 
         return Template(
             id=template_id,
@@ -192,54 +187,70 @@ class PineconeDatabase:
 
         return templates
 
-    def get_template_by_id(self, template_id: str, matter_type: str) -> Optional[Template]:
-        """Retrieves a template by ID from Pinecone."""
-        namespace = matter_type.lower().replace(" ", "-")
-        fetch_result = self.template_index.fetch(ids=[template_id], namespace=namespace)
-
-        if template_id in fetch_result.vectors:
-            metadata = fetch_result.vectors[template_id].metadata
-            try:
-                variables = json.loads(metadata.get("variables_json", "[]"))
-            except json.JSONDecodeError:
-                variables = []
-
-            return Template(
-                id=template_id,
-                name=metadata.get("name", "Unknown"),
-                matter_type=metadata.get("matter_type", matter_type),
-                description=metadata.get("description", ""),
-                markdown_content=metadata.get("markdown_content", ""),
-                variables=variables,
-                created_at=metadata.get("created_at", datetime.now().isoformat()),
-                jurisdiction=metadata.get("jurisdiction", "IN"),
-                similarity_tags=metadata.get("similarity_tags", [])
-            )
-        return None
-
-    def list_templates(self) -> List[Dict[str, Any]]:
-        """Lists all templates stored in Pinecone (for admin/debug)."""
+    def get_template_by_id(self, template_id: str, matter_type: Optional[str] = None) -> Optional[Template]:
+        """Fetch a template by ID from Pinecone, automatically checking all namespaces if not found."""
+        namespaces = []
         try:
             index_stats = self.template_index.describe_index_stats()
-            templates = []
-            for ns, stats in index_stats.namespaces.items():
-                # Pinecone doesn't allow listing metadata directly, so we query a sample
-                result = self.template_index.query(vector=[0.0]*self.EMBEDDING_DIMENSION, top_k=50, namespace=ns, include_metadata=True)
-                for match in result.matches:
-                    m = match.metadata
-                    templates.append({
-                        "id": m.get("id"),
-                        "title": m.get("name"),
-                        "doc_type": m.get("matter_type"),
-                        "jurisdiction": m.get("jurisdiction", "IN"),
-                        "description": m.get("description", ""),
-                        "created_at": m.get("created_at"),
-                        "similarity_tags": m.get("similarity_tags", []),
-                    })
-            return templates
+            namespaces = list(index_stats.namespaces.keys())
+        except Exception as e:
+            print(f"[Pinecone] Could not list namespaces: {e}")
+
+        # If a matter_type was given, prioritize that namespace
+        if matter_type:
+            ns = matter_type.lower().replace(" ", "-")
+            namespaces = [ns] + [n for n in namespaces if n != ns]
+
+        for ns in namespaces:
+            fetch_result = self.template_index.fetch(ids=[template_id], namespace=self.TEMPLATE_NAMESPACE_NAME)
+
+            if template_id in fetch_result.vectors:
+                metadata = fetch_result.vectors[template_id].metadata
+                try:
+                    variables = json.loads(metadata.get("variables_json", "[]"))
+                except json.JSONDecodeError:
+                    variables = []
+                
+                return Template(
+                    id=metadata["id"],
+                    name=metadata.get("name", "Unknown"),
+                    matter_type=metadata.get("matter_type", ns),
+                    description=metadata.get("description", ""),
+                    markdown_content=metadata.get("markdown_content", ""),
+                    variables=variables,
+                    created_at=metadata.get("created_at", datetime.now().isoformat()),
+                    jurisdiction=metadata.get("jurisdiction", "IN"),
+                    similarity_tags=metadata.get("similarity_tags", [])
+                )
+        return None
+
+
+    def list_templates(self) -> List[Dict[str, Any]]:
+        """Lists all templates from the unified namespace."""
+        templates = []
+        try:
+            result = self.template_index.query(
+                vector=[0.01] * self.EMBEDDING_DIMENSION,
+                top_k=100,
+                namespace=self.TEMPLATE_NAMESPACE_NAME,
+                include_metadata=True,
+            )
+            for match in result.matches:
+                m = match.metadata
+                templates.append({
+                    "id": m.get("id"),
+                    "title": m.get("name"),
+                    "doc_type": m.get("matter_type"),
+                    "jurisdiction": m.get("jurisdiction", "IN"),
+                    "description": m.get("description", ""),
+                    "created_at": m.get("created_at"),
+                    "similarity_tags": m.get("similarity_tags", []),
+                })
         except Exception as e:
             print(f"[Pinecone] Error listing templates: {e}")
-            return []
+        return templates
+
+
 
     # ==================== DRAFT SESSION (SQLite) ====================
 

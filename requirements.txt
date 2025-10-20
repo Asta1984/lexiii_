@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 python-multipart
-PyPDF2
+pymupdf
 python-docx
 markdown
 httpx
@@ -12,3 +12,4 @@ exa-py
 google-genai
 pinecone
 PyYAML
+email-validator

@@ -1,49 +1,41 @@
 import json
-import re
 import uuid
 import markdown
 import yaml
 from typing import List, Dict, Any, Tuple
-from google import genai
-from app.config import GOOGLE_API_KEY
 from app.models.schemas import VariableSchema, VariableType, TemplateMetadata
+from app.services.gemini_assistant import GeminiAssistant 
+from app.config import GOOGLE_API_KEY
 
 
 class TemplateEngine:
     """Converts legal documents to YAML front-matter + Markdown templates."""
 
     def __init__(self):
-        self.client = genai.Client(api_key=GOOGLE_API_KEY)
-        self.model_name = "models/gemini-2.5-flash"
-
-    def _call_gemini(self, prompt: str) -> str:
-        """Helper to call Gemini API."""
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt
-            )
-            return response.text
-        except Exception as e:
-            print(f"Error calling Gemini: {e}")
-            raise
+        # Dependency Injection (Explicitly create the assistant)
+        self.assistant = GeminiAssistant(api_key=GOOGLE_API_KEY)
 
     def convert_to_template(self, text: str, filename: str = "document") -> Dict[str, Any]:
         """
         Converts document text to template with YAML front-matter + Markdown.
-        Returns: {markdown, metadata}
+        Returns: {markdown, metadata, description}
         """
-        # Step 1: Extract variables
-        variables = self.extract_variables(text)
+        # Step 1: Extract variables (uses assistant)
+        var_data = self.assistant.extract_variables_data(text)
+        variables = self._process_variables(var_data)
         
-        # Step 2: Detect metadata
-        doc_type, jurisdiction, description = self._detect_metadata(text)
+        # Step 2: Detect metadata (uses assistant)
+        doc_type, jurisdiction, description = self.assistant.detect_metadata(text)
         
-        # Step 3: Replace variables with {{key}} placeholders
-        markdown_content = self._replace_with_placeholders(text, variables)
+        # Prepare for replacement
+        var_json = json.dumps([v.dict() for v in variables])
         
-        # Step 4: Extract similarity tags
-        tags = self._extract_tags(text, doc_type, jurisdiction, variables)
+        # Step 3: Replace variables with {{key}} placeholders (uses assistant)
+        markdown_content = self.assistant.replace_with_placeholders(text, var_json)
+        
+        # Step 4: Extract similarity tags (uses assistant)
+        var_keys = ", ".join([v.key for v in variables[:5]])
+        tags = self.assistant.extract_tags(doc_type, jurisdiction, var_keys)
         
         metadata = {
             "template_id": f"tpl_{uuid.uuid4().hex[:12]}",
@@ -61,161 +53,39 @@ class TemplateEngine:
             "description": description
         }
 
-    def extract_variables(self, text: str) -> List[VariableSchema]:
-        """
-        Uses Gemini to identify and structure variables from document text.
-        Returns list of VariableSchema objects.
-        """
-        prompt = f'''You are a legal doc templating assistant. Extract reusable variables from this document.
+    # --- HELPER METHODS (Data Processing & Formatting) ---
 
-DOCUMENT TEXT:
----
-{text[:5000]}
----
-
-Instructions:
-1. Identify all specific details that change per use (names, dates, addresses, amounts, IDs, policies, etc.)
-2. For each variable, provide: key (snake_case), label, description, example, required (bool), dtype, regex (if applicable), enum (if choices).
-3. Deduplicate: favor domain-generic names. Don't create separate vars for "party_a_name" and "party_a_full_name"—pick one.
-4. Return ONLY valid JSON array, no other text.
-
-JSON Output format:
-[
-  {{"key": "claimant_full_name", "label": "Claimant's full name", "description": "Person/entity raising claim", "example": "Raj Kumar", "required": true, "dtype": "text", "regex": null, "enum": null}},
-  {{"key": "incident_date", "label": "Date of incident", "description": "ISO 8601 format", "example": "2025-07-12", "required": true, "dtype": "date", "regex": "^\\d{{4}}-\\d{{2}}-\\d{{2}}$", "enum": null}}
-]
-
-Return ONLY JSON:'''
-
-        response_text = self._call_gemini(prompt)
-        
-        try:
-            # Clean response
-            cleaned = response_text.strip()
-            if "```" in cleaned:
-                cleaned = cleaned.split("```")[1].replace("json", "").strip()
+    def _process_variables(self, var_list: List[Dict[str, Any]]) -> List[VariableSchema]:
+        """Converts raw variable dicts from Gemini into validated VariableSchema objects."""
+        variables = []
+        for var_dict in var_list:
+            try:
+                # Validation logic moved here from original extract_variables
+                dtype = VariableType(var_dict.get("dtype", "text"))
+            except ValueError:
+                dtype = VariableType.TEXT
             
-            var_list = json.loads(cleaned)
-            variables = []
-            
-            for var_dict in var_list:
-                try:
-                    dtype = VariableType(var_dict.get("dtype", "text"))
-                except ValueError:
-                    dtype = VariableType.TEXT
-                
-                variables.append(VariableSchema(
-                    key=var_dict["key"],
-                    label=var_dict.get("label", var_dict["key"]),
-                    description=var_dict.get("description", f"Value for {var_dict['key']}"),
-                    example=var_dict.get("example", ""),
-                    required=var_dict.get("required", True),
-                    dtype=dtype,
-                    regex=var_dict.get("regex"),
-                    enum=var_dict.get("enum")
-                ))
-            
-            return variables
-        
-        except json.JSONDecodeError as e:
-            print(f"Failed to parse variables JSON: {e}")
-            return []
-
-    def _detect_metadata(self, text: str) -> Tuple[str, str, str]:
-        """Detects doc_type, jurisdiction, and description."""
-        prompt = f'''Analyze this legal document and provide metadata in JSON format:
-        
-DOCUMENT:
----
-{text[:3000]}
----
-
-Return JSON ONLY:
-{{
-  "doc_type": "e.g., Non-Disclosure Agreement, Notice, Lease Agreement, Contract, etc.",
-  "jurisdiction": "e.g., IN, US-NY, UK, AU, etc. Use ISO country/state codes.",
-  "description": "One-sentence purpose of this document."
-}}'''
-        
-        response_text = self._call_gemini(prompt)
-        
-        try:
-            cleaned = response_text.strip()
-            if "```" in cleaned:
-                cleaned = cleaned.split("```")[1].replace("json", "").strip()
-            
-            metadata = json.loads(cleaned)
-            return (
-                metadata.get("doc_type", "Legal Document"),
-                metadata.get("jurisdiction", "IN"),
-                metadata.get("description", "Legal document")
-            )
-        except json.JSONDecodeError:
-            return ("Legal Document", "IN", "Legal document")
-
-    def _replace_with_placeholders(self, text: str, variables: List[VariableSchema]) -> str:
-        """
-        Replaces variable values with {{key}} placeholders.
-        Uses Gemini to intelligently identify and replace variable values in text.
-        """
-        var_json = json.dumps([v.dict() for v in variables])
-        
-        prompt = f'''Given this document text and list of variables, replace all actual values with {{{{key}}}} placeholders.
-
-VARIABLES (JSON):
-{var_json}
-
-DOCUMENT TEXT:
----
-{text[:6000]}
----
-
-Rules:
-1. For each variable key, find and replace the actual value(s) in the text with {{{{key}}}}.
-2. Keep all other text unchanged.
-3. Return ONLY the modified document text, nothing else.
-
-Output (document with placeholders):'''
-        
-        try:
-            return self._call_gemini(prompt)
-        except Exception:
-            # Fallback: return original
-            return text
-
-    def _extract_tags(self, text: str, doc_type: str, jurisdiction: str, variables: List[VariableSchema]) -> List[str]:
-        """Extracts similarity tags for template matching."""
-        var_keys = ", ".join([v.key for v in variables[:5]])
-        
-        prompt = f'''Extract 5-7 short tags (lowercase, comma-separated) for template retrieval.
-        
-Doc type: {doc_type}
-Jurisdiction: {jurisdiction}
-Key variables: {var_keys}
-
-Examples: "insurance", "notice", "india", "motor", "health", "contract", "agreement"
-
-Return tags ONLY (comma-separated):'''
-        
-        try:
-            response = self._call_gemini(prompt).strip().lower().split(",")
-            return [tag.strip() for tag in response if tag.strip()]
-        except Exception:
-            return [doc_type.lower(), jurisdiction.lower()]
+            variables.append(VariableSchema(
+                key=var_dict.get("key"),
+                label=var_dict.get("label", var_dict.get("key")),
+                description=var_dict.get("description", f"Value for {var_dict.get('key')}"),
+                example=var_dict.get("example", ""),
+                required=var_dict.get("required", True),
+                dtype=dtype,
+                regex=var_dict.get("regex"),
+                enum=var_dict.get("enum")
+            ))
+        return variables
 
     def _infer_title(self, filename: str, doc_type: str) -> str:
         """Infers template title from filename or doc_type."""
-        # Remove extension
         name = filename.rsplit(".", 1)[0]
-        
         if name and name != "document":
             return name.replace("_", " ").title()
-        
         return f"{doc_type} Template"
 
     def build_yaml_frontmatter(self, metadata: Dict[str, Any]) -> str:
-        """Generates YAML front-matter from metadata dict."""
-
+        # (Unchanged)
         data = {
             "template_id": metadata["template_id"],
             "title": metadata["title"],
@@ -228,15 +98,12 @@ Return tags ONLY (comma-separated):'''
         return f"---\n{yaml.dump(data, default_flow_style=False)}---\n"
 
     def render_template_with_frontmatter(self, metadata: Dict[str, Any], markdown_content: str) -> str:
-        """Combines YAML front-matter + Markdown content."""
+        # (Unchanged)
         frontmatter = self.build_yaml_frontmatter(metadata)
         return f"{frontmatter}\n{markdown_content}"
 
     def parse_template(self, template_content: str) -> Tuple[Dict[str, Any], str]:
-        """
-        Parses a template file (YAML front-matter + Markdown).
-        Returns: (metadata_dict, markdown_content)
-        """
+        # (Unchanged)
         if not template_content.startswith("---"):
             raise ValueError("Template must start with '---'")
         
@@ -251,14 +118,12 @@ Return tags ONLY (comma-separated):'''
         return metadata, markdown
 
     def generate_draft(self, markdown_content: str, values: Dict[str, Any]) -> Dict[str, str]:
-        """Fills template with values to generate final draft."""
+        # (Unchanged)
         draft_md = markdown_content
-        
         for key, value in values.items():
             placeholder = f"{{{{{key}}}}}"
             draft_md = draft_md.replace(placeholder, str(value))
         
-        # Convert Markdown to HTML
         draft_html = markdown.markdown(draft_md)
         
         return {
@@ -267,6 +132,6 @@ Return tags ONLY (comma-separated):'''
         }
 
     def get_missing_variables(self, variables: List[VariableSchema], filled_values: Dict[str, Any]) -> List[VariableSchema]:
-        """Returns required variables not yet filled."""
+        # (Unchanged)
         filled_keys = set(filled_values.keys())
         return [v for v in variables if v.required and v.key not in filled_keys]

@@ -36,6 +36,15 @@ class TemplateMetadata(BaseModel):
     similarity_tags: List[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None
 
+class TemplateListItem(BaseModel):
+    id: str
+    title: str
+    doc_type: str
+    jurisdiction: str
+    description: str
+    created_at: datetime
+    similarity_tags: List[str] = []
+
 
 class TemplateResponse(BaseModel):
     """Full template with metadata + markdown content"""
