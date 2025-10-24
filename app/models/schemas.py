@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from enum import Enum
 from datetime import datetime
 
@@ -18,7 +18,7 @@ class VariableSchema(BaseModel):
     key: str
     label: str
     description: str
-    example: str
+    example: Union[str, List[str]]
     required: bool = True
     dtype: VariableType = VariableType.TEXT
     regex: Optional[str] = None
