@@ -18,7 +18,7 @@ class VariableSchema(BaseModel):
     key: str
     label: str
     description: str
-    example: Union[str, List[str]]
+    example: Union[str, List[str], Any]
     required: bool = True
     dtype: VariableType = VariableType.TEXT
     regex: Optional[str] = None
