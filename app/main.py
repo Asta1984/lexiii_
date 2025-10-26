@@ -21,6 +21,8 @@ from app.services.pinecone_service import PineconeDatabase
 
 from google import genai
 from app.config import GOOGLE_API_KEY
+from fastapi.middleware.cors import CORSMiddleware
+
 
 
 # ==================== INITIALIZATION ====================
@@ -44,6 +46,15 @@ app = FastAPI(
         "name": "MIT License",
         "url": "https://opensource.org/licenses/MIT"
     },
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 def get_file_mime_type(file: UploadFile) -> str:
