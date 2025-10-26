@@ -32,7 +32,7 @@ class Template:
         self.markdown_content = markdown_content
         self.variables = variables
         self.created_at = created_at
-        self.jurisdiction = jurisdiction or "IN"
+        self.jurisdiction = jurisdiction
         self.similarity_tags = similarity_tags or []
 
 
@@ -159,7 +159,8 @@ class PineconeDatabase:
         results = self.template_index.query(
             vector=query_vector,
             top_k=k,
-            include_metadata=True
+            include_metadata=True,
+            namespace=self.TEMPLATE_NAMESPACE_NAME
         )
 
         templates = []
@@ -179,7 +180,7 @@ class PineconeDatabase:
                     markdown_content=metadata.get("markdown_content", ""),
                     variables=variables,
                     created_at=metadata.get("created_at", datetime.now().isoformat()),
-                    jurisdiction=metadata.get("jurisdiction", "IN"),
+                    jurisdiction=metadata.get("jurisdiction"),
                     similarity_tags=metadata.get("similarity_tags", [])
                 ),
                 "score": match.score
